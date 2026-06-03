@@ -1,0 +1,34 @@
+# Model weights and checkpoints (large binary files)
+*.safetensors
+*.ckpt
+*.pt
+*.pth
+*.bin
+*.npz
+*.npy
+
+# Flux fine-tuning personal data and outputs
+nvidia/flux-finetuning/assets/flux_data/DaveHangLoraTrain1/
+nvidia/flux-finetuning/assets/flux_data/loraTrainHeadshot/
+nvidia/flux-finetuning/assets/flux_data/sparkgpu/
+nvidia/flux-finetuning/assets/flux_data/tjtoy/
+nvidia/flux-finetuning/assets/flux_data/datax.toml
+nvidia/flux-finetuning/assets/models/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+dist/
+build/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+*.swp
