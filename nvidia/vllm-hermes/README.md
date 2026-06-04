@@ -18,7 +18,7 @@
 This playbook sets up [vLLM](https://github.com/vllm-project/vllm) as a local OpenAI-compatible
 inference server on your NVIDIA DGX Spark, then configures [Hermes Agent](https://hermes-agent.nousresearch.com)
 to use it as its model backend. vLLM runs inside Docker using NVIDIA's CUDA 13.0 nightly image,
-which includes full Blackwell (SM121) GPU support, FlashAttention, and FP8/NVFP4 quantization.
+which includes full Blackwell (SM121) GPU support, FlashAttention, and FP8 quantization.
 
 ## What you'll accomplish
 
@@ -70,9 +70,10 @@ export HF_TOKEN=$(cat ~/.cache/huggingface/token)
 
 ## Step 2. Start the vLLM server
 
-**Description**: Launch vLLM in Docker serving `RedHatAI/Qwen3.6-35B-A3B-NVFP4` — a Qwen3.6
-35B MoE model in NVFP4 (4-bit) quantization, natively accelerated on the DGX Spark's Blackwell
-GB10 GPU. This is the validated production configuration.
+**Description**: Launch vLLM in Docker serving `Qwen/Qwen3.6-35B-A3B-FP8` — the official Qwen3.6
+35B MoE model in FP8 quantization. FP8 is the recommended quantization on DGX Spark because
+SM121 (GB10) has native FP8 hardware support but lacks the `cvt.e2m1x2` instruction needed for
+native FP4 execution, making NVFP4 ~32% slower in practice.
 
 ```bash
 docker run -d --gpus all \
@@ -83,13 +84,9 @@ docker run -d --gpus all \
   -e HF_TOKEN=$HF_TOKEN \
   -e VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 \
   -e CUTE_DSL_ARCH=sm_121a \
-  -e VLLM_USE_FLASHINFER_MOE_FP4=0 \
-  -e FLASHINFER_DISABLE_VERSION_CHECK=1 \
-  -e VLLM_TEST_FORCE_FP8_MARLIN=1 \
+  -e VLLM_MARLIN_USE_ATOMIC_ADD=1 \
   vllm/vllm-openai:cu130-nightly \
-  RedHatAI/Qwen3.6-35B-A3B-NVFP4 \
-  --quantization compressed-tensors \
-  --moe-backend marlin \
+  Qwen/Qwen3.6-35B-A3B-FP8 \
   --port 8000 \
   --host 0.0.0.0 \
   --trust-remote-code \
@@ -97,24 +94,28 @@ docker run -d --gpus all \
   --gpu-memory-utilization 0.85 \
   --max-model-len 65536 \
   --max-num-seqs 4 \
-  --max-num-batched-tokens 8192 \
+  --max-num-batched-tokens 32768 \
   --enable-chunked-prefill \
   --enable-prefix-caching \
   --enable-auto-tool-choice \
-  --tool-call-parser hermes \
-  --reasoning-parser qwen3
+  --tool-call-parser qwen3_xml
 ```
 
 > **Key flags explained:**
 > - `--restart unless-stopped` — container auto-restarts after reboot
 > - `CUTE_DSL_ARCH=sm_121a` — targets DGX Spark's Blackwell SM121 GPU
-> - `VLLM_TEST_FORCE_FP8_MARLIN=1` — forces Marlin GEMM (FlashInfer CUTLASS broken on SM121)
-> - `VLLM_USE_FLASHINFER_MOE_FP4=0` — disables broken FP4 MoE path on SM121
-> - `--quantization compressed-tensors` — required for RedHatAI NVFP4 checkpoint format
-> - `--moe-backend marlin` — correct backend for W4A4 NVFP4 MoE on Blackwell
-> - `--reasoning-parser qwen3` — separates `<think>` reasoning from the actual response
-> - `--enable-auto-tool-choice --tool-call-parser hermes` — required for Hermes Agent tool calls
+> - `VLLM_MARLIN_USE_ATOMIC_ADD=1` — fixes non-deterministic Marlin kernel reductions on SM121
 > - `VLLM_ALLOW_LONG_MAX_MODEL_LEN=1` — allows 65K context (model config reports 40K max)
+> - `--max-num-batched-tokens 32768` — prefill budget; large enough for long prompts without excessive VRAM
+> - `--enable-auto-tool-choice --tool-call-parser qwen3_xml` — required for Hermes Agent tool calls with Qwen3.6 FP8
+
+### Why FP8 instead of NVFP4
+
+DGX Spark's GB10 is SM121, which does **not** have native FP4 tensor core instructions
+(`cvt.rn.satfinite.e2m1x2.f32`). NVFP4 falls back to Marlin dequant kernels (40.8 tok/s)
+while FP8 runs natively (53.8 tok/s) — a 32% performance advantage. Additionally, Qwen3.6's
+hybrid GDN (Gated DeltaNet) attention layers caused silent weight-loading bugs with community
+NVFP4 checkpoints on both vLLM and SGLang, producing garbage output. FP8 avoids both issues.
 
 ## Step 3. Wait for the server to be ready
 
@@ -146,7 +147,7 @@ curl -s http://localhost:8000/v1/models | python3 -m json.tool
 
 ```yaml
 model:
-  default: RedHatAI/Qwen3.6-35B-A3B-NVFP4
+  default: Qwen/Qwen3.6-35B-A3B-FP8
   provider: custom
   base_url: http://localhost:8000/v1
   context_length: 65536
@@ -156,9 +157,10 @@ And the `custom_providers` block near the bottom:
 
 ```yaml
 custom_providers:
-- name: Local vLLM Qwen3.6-35B-NVFP4
+- name: Local vLLM Qwen3.6-35B-FP8
   base_url: http://localhost:8000/v1
-  model: RedHatAI/Qwen3.6-35B-A3B-NVFP4
+  context_length: 65536
+  model: Qwen/Qwen3.6-35B-A3B-FP8
 ```
 
 > **Important**: `context_length: 65536` is required — Hermes reads context from the model's
@@ -177,7 +179,7 @@ hermes gateway restart
 hermes chat -q "What model are you? /no_think"
 ```
 
-Expected: Hermes responds identifying itself as `RedHatAI/Qwen3.6-35B-A3B-NVFP4`.
+Expected: Hermes responds identifying itself as `Qwen/Qwen3.6-35B-A3B-FP8`.
 
 ---
 
@@ -193,18 +195,17 @@ hermes gateway restart
 
 ### Model compatibility on DGX Spark (SM121)
 
-| Model | Size | Quantization | vLLM flags |
-|-------|------|-------------|------------|
-| `RedHatAI/Qwen3.6-35B-A3B-NVFP4` *(recommended)* | ~24 GB | compressed-tensors NVFP4 | `--quantization compressed-tensors --moe-backend marlin` |
-| `Qwen/Qwen3-8B` *(lightweight fallback)* | ~16 GB | BF16 | `--enable-auto-tool-choice --tool-call-parser hermes` |
+| Model | Size | Quantization | Notes |
+|-------|------|-------------|-------|
+| `Qwen/Qwen3.6-35B-A3B-FP8` *(recommended)* | ~24 GB | FP8 | Native SM121 FP8 support, 53.8 tok/s, no extra vLLM quantization flags needed |
+| `Qwen/Qwen3-8B` *(lightweight fallback)* | ~16 GB | BF16 | No quantization flags needed; good for testing |
+| `RedHatAI/Qwen3.6-35B-A3B-NVFP4` *(not recommended)* | ~22 GB | compressed-tensors NVFP4 | 32% slower than FP8 on SM121; requires `--quantization compressed-tensors --moe-backend marlin` plus NVFP4 env vars; GDN weight-loading bugs in older vLLM/SGLang versions |
 
-For any NVFP4 model on SM121, always include:
+For any model on SM121, always include:
 
 ```bash
 -e CUTE_DSL_ARCH=sm_121a \
--e VLLM_USE_FLASHINFER_MOE_FP4=0 \
--e FLASHINFER_DISABLE_VERSION_CHECK=1 \
--e VLLM_TEST_FORCE_FP8_MARLIN=1 \
+-e VLLM_MARLIN_USE_ATOMIC_ADD=1 \
 ```
 
 ---
@@ -213,12 +214,11 @@ For any NVFP4 model on SM121, always include:
 
 | Symptom | Cause | Fix |
 |---------|-------|-----|
-| HTTP 400: `"auto" tool choice requires --enable-auto-tool-choice` | Missing tool call flags | Add `--enable-auto-tool-choice --tool-call-parser hermes` |
+| HTTP 400: `"auto" tool choice requires --enable-auto-tool-choice` | Missing tool call flags | Add `--enable-auto-tool-choice --tool-call-parser qwen3_xml` |
 | `context window below minimum 64,000` | Hermes reads model config, not vLLM's max | Add `context_length: 65536` under `model:` in `~/.hermes/config.yaml` |
 | `max_model_len greater than derived max_model_len` | Model config reports 40K max | Add `-e VLLM_ALLOW_LONG_MAX_MODEL_LEN=1` |
-| `moe_backend='marlin' is not supported for unquantized MoE` | Wrong model — use W4A16 format, not W4A4 | Switch to `RedHatAI/Qwen3.6-35B-A3B-NVFP4` (compressed-tensors W4A4) |
-| `moe_backend='triton' is not supported for NvFP4 MoE` | triton doesn't support NVFP4 MoE | Use `--moe-backend marlin` for NVFP4 models |
-| `KeyError: 'layers.0.mlp.experts.w2_input_scale'` | nvidia/ checkpoint uses W4A16 (weight-only) | Use `RedHatAI/` checkpoint instead (W4A4) |
-| Response contains raw `<think>` tags | Reasoning not parsed | Add `--reasoning-parser qwen3` |
+| NVFP4 model ~32% slower than expected | SM121 lacks native FP4 instructions | Switch to FP8: `Qwen/Qwen3.6-35B-A3B-FP8` |
+| NVFP4 model produces `!!!!!!!!` garbage | GDN linear_attn weights silently dropped | Known bug in older vLLM/SGLang with community NVFP4 checkpoints; switch to FP8 |
+| Response contains raw `<think>` tags | Reasoning not parsed | Add `--reasoning-parser qwen3` to vLLM command if needed |
 | Container not running after reboot | Missing restart policy | Add `--restart unless-stopped` or run `docker update --restart unless-stopped vllm-server` |
 | GPU memory shows `[N/A]` in nvidia-smi | Normal on GB10 unified memory | Not an error — GB10 shares CPU/GPU memory |
