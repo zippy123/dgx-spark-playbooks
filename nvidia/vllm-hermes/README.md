@@ -6,6 +6,7 @@
 
 - [Overview](#overview)
 - [Instructions](#instructions)
+- [Switching Models](#switching-models)
 - [Troubleshooting](#troubleshooting)
 
 ---
@@ -40,8 +41,8 @@ agent workflows on your DGX Spark.
 
 ## Time & risk
 
-**Duration**: 5-10 minutes for setup; 5-15 minutes for model download (depends on model size and
-internet speed); 2-5 minutes for CUDA graph compilation on first start
+**Duration**: 5-10 minutes for setup; 15-25 minutes on first start (model download + CUDA graph
+compilation); ~4-5 minutes on subsequent starts (cached)
 
 **Risk level**: Low — only modifies `~/.hermes/config.yaml` (a backup exists at
 `~/.hermes/config.yaml.bak.*`), easily reversible
@@ -69,125 +70,137 @@ export HF_TOKEN=$(cat ~/.cache/huggingface/token)
 
 ## Step 2. Start the vLLM server
 
-**Description**: Launch vLLM in Docker with a model that meets Hermes Agent's 64K minimum context
-requirement. `Qwen/Qwen3-8B` (BF16, ~16 GB) is a reliable default. The `VLLM_ALLOW_LONG_MAX_MODEL_LEN=1`
-flag is required because Qwen3-8B's config reports 40K max context but supports 65K via RoPE scaling.
+**Description**: Launch vLLM in Docker serving `RedHatAI/Qwen3.6-35B-A3B-NVFP4` — a Qwen3.6
+35B MoE model in NVFP4 (4-bit) quantization, natively accelerated on the DGX Spark's Blackwell
+GB10 GPU. This is the validated production configuration.
 
 ```bash
 docker run -d --gpus all \
   --name vllm-server \
+  --restart unless-stopped \
   -v ~/.cache/huggingface:/root/.cache/huggingface \
   -p 8000:8000 \
   -e HF_TOKEN=$HF_TOKEN \
   -e VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 \
+  -e CUTE_DSL_ARCH=sm_121a \
+  -e VLLM_USE_FLASHINFER_MOE_FP4=0 \
+  -e FLASHINFER_DISABLE_VERSION_CHECK=1 \
+  -e VLLM_TEST_FORCE_FP8_MARLIN=1 \
   vllm/vllm-openai:cu130-nightly \
-  Qwen/Qwen3-8B \
+  RedHatAI/Qwen3.6-35B-A3B-NVFP4 \
+  --quantization compressed-tensors \
+  --moe-backend marlin \
   --port 8000 \
   --host 0.0.0.0 \
+  --trust-remote-code \
+  --dtype auto \
+  --gpu-memory-utilization 0.85 \
   --max-model-len 65536 \
-  --gpu-memory-utilization 0.7 \
+  --max-num-seqs 4 \
+  --max-num-batched-tokens 8192 \
+  --enable-chunked-prefill \
+  --enable-prefix-caching \
   --enable-auto-tool-choice \
-  --tool-call-parser hermes
+  --tool-call-parser hermes \
+  --reasoning-parser qwen3
 ```
 
-> **Note**: `--enable-auto-tool-choice` and `--tool-call-parser hermes` are required — Hermes Agent
-> sends tool calls to the model and will get HTTP 400 errors without these flags.
+> **Key flags explained:**
+> - `--restart unless-stopped` — container auto-restarts after reboot
+> - `CUTE_DSL_ARCH=sm_121a` — targets DGX Spark's Blackwell SM121 GPU
+> - `VLLM_TEST_FORCE_FP8_MARLIN=1` — forces Marlin GEMM (FlashInfer CUTLASS broken on SM121)
+> - `VLLM_USE_FLASHINFER_MOE_FP4=0` — disables broken FP4 MoE path on SM121
+> - `--quantization compressed-tensors` — required for RedHatAI NVFP4 checkpoint format
+> - `--moe-backend marlin` — correct backend for W4A4 NVFP4 MoE on Blackwell
+> - `--reasoning-parser qwen3` — separates `<think>` reasoning from the actual response
+> - `--enable-auto-tool-choice --tool-call-parser hermes` — required for Hermes Agent tool calls
+> - `VLLM_ALLOW_LONG_MAX_MODEL_LEN=1` — allows 65K context (model config reports 40K max)
 
 ## Step 3. Wait for the server to be ready
 
-**Description**: The first start downloads model weights and compiles CUDA graphs. Monitor the logs
-until you see `Application startup complete`.
+**Description**: Monitor logs until startup is complete.
 
 ```bash
 docker logs vllm-server --follow
 ```
 
 Typical timeline:
-- Model download: 2-10 min (cached on subsequent starts)
-- Weight loading: ~2 min
-- CUDA graph compilation: ~1 min
-- **Total first start**: ~5-15 min
-- **Subsequent starts**: ~3 min
+- Model download (~24 GB): 10-20 min (skipped if cached)
+- Weight loading: ~10 min
+- CUDA graph compilation: ~3 min
+- **Total first start**: ~25 min
+- **Subsequent starts**: ~4-5 min
 
-## Step 4. Verify the server is responding
+Look for: `Application startup complete`
 
-**Description**: Confirm vLLM is serving the model correctly before configuring Hermes.
+## Step 4. Verify the server
 
 ```bash
+curl -s http://localhost:8000/health && echo "OK"
 curl -s http://localhost:8000/v1/models | python3 -m json.tool
 ```
 
-Expected output includes `"id": "Qwen/Qwen3-8B"`.
+## Step 5. Configure Hermes
 
-## Step 5. Configure Hermes to use vLLM
-
-**Description**: Update `~/.hermes/config.yaml` to point to the local vLLM endpoint. Edit the
-`model` section at the top of the file:
+**Description**: Update `~/.hermes/config.yaml`. Edit the `model` block at the top:
 
 ```yaml
 model:
-  default: Qwen/Qwen3-8B
+  default: RedHatAI/Qwen3.6-35B-A3B-NVFP4
   provider: custom
   base_url: http://localhost:8000/v1
-  context_length: 65536   # override: model config reports 40960 but vLLM serves 65536
+  context_length: 65536
 ```
 
-Also update `custom_providers` near the bottom of the file:
+And the `custom_providers` block near the bottom:
 
 ```yaml
 custom_providers:
-- name: Local vLLM Qwen3-8B
+- name: Local vLLM Qwen3.6-35B-NVFP4
   base_url: http://localhost:8000/v1
-  model: Qwen/Qwen3-8B
+  model: RedHatAI/Qwen3.6-35B-A3B-NVFP4
 ```
 
-> **Important**: The `context_length: 65536` override is necessary because Hermes reads the context
-> window from the model's HuggingFace config (which reports 40960), not from vLLM's
-> `--max-model-len` flag. Without this override, Hermes will refuse to start with a
-> "context window below minimum 64,000" error.
+> **Important**: `context_length: 65536` is required — Hermes reads context from the model's
+> HuggingFace config (which reports 40,960), not from vLLM's `--max-model-len`. Without this
+> override Hermes refuses to start with a "context window below minimum 64,000" error.
 
 ## Step 6. Restart Hermes
-
-**Description**: Apply the config changes by restarting the Hermes gateway service.
 
 ```bash
 hermes gateway restart
 ```
 
-## Step 7. Verify the integration
-
-**Description**: Run an end-to-end test to confirm Hermes is routing through vLLM correctly.
+## Step 7. Verify end-to-end
 
 ```bash
 hermes chat -q "What model are you? /no_think"
 ```
 
-Expected: Hermes responds identifying itself as `Qwen/Qwen3-8B`.
+Expected: Hermes responds identifying itself as `RedHatAI/Qwen3.6-35B-A3B-NVFP4`.
 
 ---
 
-## Switching models
+## Switching Models
 
-To swap the model, stop the container, update the Docker command and `config.yaml`, then restart:
+Stop the container, update the model in the docker command and `config.yaml`, then restart:
 
 ```bash
 docker rm -f vllm-server
-# Update model name in the docker run command and config.yaml
+# Edit model name in docker run and ~/.hermes/config.yaml
 hermes gateway restart
 ```
 
-### Model compatibility notes
+### Model compatibility on DGX Spark (SM121)
 
-| Model | Context | Notes |
-|-------|---------|-------|
-| `Qwen/Qwen3-8B` | 65K (override) | Default recommendation; BF16, no quantization required |
-| `Qwen/Qwen3-14B` | 65K (override) | Larger, better quality; ~28 GB BF16 |
-| `RedHatAI/Qwen3.6-35B-A3B-NVFP4` | 65K | Hybrid MoE NVFP4; use `--quantization compressed-tensors --moe-backend marlin` |
+| Model | Size | Quantization | vLLM flags |
+|-------|------|-------------|------------|
+| `RedHatAI/Qwen3.6-35B-A3B-NVFP4` *(recommended)* | ~24 GB | compressed-tensors NVFP4 | `--quantization compressed-tensors --moe-backend marlin` |
+| `Qwen/Qwen3-8B` *(lightweight fallback)* | ~16 GB | BF16 | `--enable-auto-tool-choice --tool-call-parser hermes` |
 
-For NVFP4 models on DGX Spark (SM121), add these env vars to the docker run command:
+For any NVFP4 model on SM121, always include:
 
 ```bash
--e VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 \
 -e CUTE_DSL_ARCH=sm_121a \
 -e VLLM_USE_FLASHINFER_MOE_FP4=0 \
 -e FLASHINFER_DISABLE_VERSION_CHECK=1 \
@@ -196,27 +209,16 @@ For NVFP4 models on DGX Spark (SM121), add these env vars to the docker run comm
 
 ---
 
-## Step 8. (Optional) Persist the container across reboots
-
-**Description**: Add a `--restart unless-stopped` flag so vLLM starts automatically after a reboot.
-
-```bash
-docker update --restart unless-stopped vllm-server
-```
-
-Or recreate with the restart policy included in the original `docker run` command by adding
-`--restart unless-stopped`.
-
----
-
 ## Troubleshooting
 
 | Symptom | Cause | Fix |
 |---------|-------|-----|
-| HTTP 400: `"auto" tool choice requires --enable-auto-tool-choice` | vLLM started without tool call flags | Add `--enable-auto-tool-choice --tool-call-parser hermes` to docker run |
-| `context window below minimum 64,000` in Hermes | Model config reports context < 64K | Add `context_length: 65536` under `model:` in `~/.hermes/config.yaml` |
-| `User-specified max_model_len is greater than derived max_model_len` | vLLM rejects 65K for models reporting 40K config | Add `-e VLLM_ALLOW_LONG_MAX_MODEL_LEN=1` to docker run |
-| `moe_backend='marlin' is not supported for unquantized MoE` | Wrong MoE backend for model's quantization type | Use `--moe-backend triton` for W4A16 models, `--moe-backend marlin` for W4A4 |
-| Container exits immediately | vLLM entrypoint syntax error | Check `docker logs vllm-server` for the exact error |
-| GPU memory OOM during weight load | Model too large for available memory | Reduce `--gpu-memory-utilization` or use a smaller/quantized model |
-| `Application startup complete` never appears | CUDA graph compilation hanging | Wait 15-30 min on first start; check `docker logs` for progress |
+| HTTP 400: `"auto" tool choice requires --enable-auto-tool-choice` | Missing tool call flags | Add `--enable-auto-tool-choice --tool-call-parser hermes` |
+| `context window below minimum 64,000` | Hermes reads model config, not vLLM's max | Add `context_length: 65536` under `model:` in `~/.hermes/config.yaml` |
+| `max_model_len greater than derived max_model_len` | Model config reports 40K max | Add `-e VLLM_ALLOW_LONG_MAX_MODEL_LEN=1` |
+| `moe_backend='marlin' is not supported for unquantized MoE` | Wrong model — use W4A16 format, not W4A4 | Switch to `RedHatAI/Qwen3.6-35B-A3B-NVFP4` (compressed-tensors W4A4) |
+| `moe_backend='triton' is not supported for NvFP4 MoE` | triton doesn't support NVFP4 MoE | Use `--moe-backend marlin` for NVFP4 models |
+| `KeyError: 'layers.0.mlp.experts.w2_input_scale'` | nvidia/ checkpoint uses W4A16 (weight-only) | Use `RedHatAI/` checkpoint instead (W4A4) |
+| Response contains raw `<think>` tags | Reasoning not parsed | Add `--reasoning-parser qwen3` |
+| Container not running after reboot | Missing restart policy | Add `--restart unless-stopped` or run `docker update --restart unless-stopped vllm-server` |
+| GPU memory shows `[N/A]` in nvidia-smi | Normal on GB10 unified memory | Not an error — GB10 shares CPU/GPU memory |
