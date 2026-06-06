@@ -7,6 +7,7 @@
 - [Overview](#overview)
 - [Instructions](#instructions)
 - [Switching Models](#switching-models)
+- [Remote Access from Another Machine](#remote-access-from-another-machine)
 - [Troubleshooting](#troubleshooting)
 
 ---
@@ -206,6 +207,67 @@ For any model on SM121, always include:
 ```bash
 -e CUTE_DSL_ARCH=sm_121a \
 -e VLLM_MARLIN_USE_ATOMIC_ADD=1 \
+```
+
+---
+
+## Remote Access from Another Machine
+
+vLLM binds to `0.0.0.0:8000`, so any machine on your local network can use it as an
+inference backend. This lets you run Hermes on a laptop (e.g. a MacBook) while the model
+runs on the Spark — no cloud API needed.
+
+### Step 1. Find the Spark's IP
+
+On the Spark:
+
+```bash
+hostname -I | awk '{print $1}'
+```
+
+### Step 2. Test connectivity from the remote machine
+
+```bash
+curl -s http://<SPARK_IP>:8000/health && echo " OK"
+```
+
+If this fails, open the port on the Spark:
+
+```bash
+sudo ufw allow from 192.168.1.0/24 to any port 8000
+```
+
+### Step 3. Configure Hermes on the remote machine
+
+```bash
+hermes config set model.provider custom
+hermes config set model.base_url http://<SPARK_IP>:8000/v1
+hermes config set model.default "Qwen/Qwen3.6-35B-A3B-FP8"
+hermes config set model.context_length 65536
+```
+
+### Step 4. Restart Hermes and verify
+
+```bash
+hermes gateway restart
+hermes chat -q "What model are you? /no_think"
+```
+
+### Concurrency
+
+vLLM handles multiple clients simultaneously via continuous batching. The current config
+(`--max-num-seqs 4`) supports up to 4 concurrent requests. Multiple Hermes instances
+(e.g. Spark + MacBook) share the same model without conflicts — vLLM queues overflow
+requests automatically.
+
+### Security note
+
+The vLLM endpoint has **no authentication**. Anyone on your local network who can reach
+port 8000 can use the model. To restrict access to a specific machine:
+
+```bash
+sudo ufw allow from <CLIENT_IP> to any port 8000
+sudo ufw deny 8000
 ```
 
 ---
